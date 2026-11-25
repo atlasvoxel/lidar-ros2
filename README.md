@@ -1,182 +1,159 @@
 # Multi-LiDAR Perception Pipeline (ROS 2)
 
-## Main Goal
-Build a **reproducible, modular ROS 2 perception pipeline** for a **fixed-mounted multi-LiDAR setup**, enabling:
-- **Time/TF-aligned fusion** of multiple LiDAR point clouds into a common frame
-- **Object detection (clustering)** on both **per-sensor** and **fused** point clouds
-- **Clear RViz visualization** for qualitative evaluation and debugging
+Real-time fusion, object detection and tracking for four SICK LiDAR sensors on the research vessel **NOVA**, built with ROS 2 Jazzy, C++ (PCL) and Python.
+
+Developed as a project in the Mechatronics Lab at the University of Duisburg-Essen. The goal was a reproducible, modular perception pipeline for a fixed-mounted multi-LiDAR setup that:
+
+- fuses four point clouds into one common frame using TF,
+- detects objects with two different clustering approaches (PCL in C++, DBSCAN in Python), on each sensor and on the fused cloud,
+- tracks detected objects over time with a Kalman filter,
+- measures processing time and detection counts so the configurations can be compared.
+
+<!-- TODO: add an RViz screenshot or GIF of the fused cloud with bounding boxes and tracks here -->
+
+---
+
+## Pipeline overview
+
+```
+ /front/cloud ─┐
+ /right/cloud ─┤                                   ┌─> object_detector_pcl (C++) ─┐
+ /back/cloud  ─┼─> cloud_fusion ─> /nova/cloud_fused┤                              ├─> object_tracker ─> /tracks/*
+ /left/cloud  ─┘   (TF + voxel dedup)              └─> cloud_detector (DBSCAN)  ──┘
+                                                          │
+                                                          └─> metrics_csv_logger ─> results/*.csv
+```
+
+| Stage | Node | Language | What it does |
+|---|---|---|---|
+| Frames | `robot_state_publisher` + `lidar_description` | URDF/Xacro | Fixed sensor frames on the vessel (`ship.urdf.xacro`) |
+| Fusion | `cloud_fusion` | Python | Transforms all four clouds into `base_link`, drops stale clouds (`max_age_sec`), voxel de-duplication of overlapping regions, publishes `/nova/cloud_fused` |
+| Detection (PCL) | `object_detector_pcl` | C++ | Voxel downsampling, statistical outlier removal, RANSAC plane removal, Euclidean clustering, bounding boxes as `MarkerArray` |
+| Detection (DBSCAN) | `cloud_detector` | Python | Optional voxel downsampling, DBSCAN clustering (scikit-learn), bounding boxes as `MarkerArray` |
+| Tracking | `object_tracker` | Python | Hungarian data association, one constant-velocity Kalman filter per track, stable track IDs and velocity output |
+| Metrics | `metrics_csv_logger` | Python | Logs processing time, input points and detections per sensor/configuration to CSV |
+| Tuning | `tuner/param_tuner.py` | Python | Local web UI to change DBSCAN/PCL parameters live (via `ros2 param set`) and save them back to YAML |
+
+Helper nodes: `cloud_filter` (range/height filter, plus voxel filter in C++), `cloud_monitor` (C++/Python topic statistics), `plane_remove_o3d` (Open3D RANSAC plane removal).
+
+---
+
+## Results
+
+Recorded with the real sensors; 11,073 metric samples in total. Values are means with standard deviation.
+
+**Processing time per frame (ms)**
+
+| Input | PCL (C++) | DBSCAN (Python) |
+|---|---|---|
+| Fused cloud | 135.4 ± 24.2 | 156.3 ± 28.1 |
+| Front | 123.8 ± 22.9 | 80.8 ± 15.4 |
+| Right | 117.3 ± 20.4 | 88.0 ± 16.6 |
+| Left | 139.4 ± 24.3 | 90.1 ± 15.3 |
+| Back | 98.2 ± 13.6 | 68.9 ± 11.8 |
+
+**Detections per frame**
+
+| Input | PCL (C++) | DBSCAN (Python) |
+|---|---|---|
+| Fused cloud | 75.2 ± 10.4 | 31.2 ± 4.3 |
+| Single sensor | 27–35 | 10–12 |
+
+![Processing time by sensor and configuration](results/plots/proc_time_boxplot.png)
+![Average detections by sensor and configuration](results/plots/detections_barplot.png)
+
+Notes:
+- Point and detection counts depend on each detector's preprocessing and tuned parameters, so the numbers compare the two tuned configurations rather than the bare algorithms.
+- All plots are in [`results/plots/`](results/plots/), the full summary in [`metrics_summary.txt`](results/plots/metrics_summary.txt), and the raw logs in `results/*.csv`. Plots are generated with `visualize_lidar_metrics.py` (install its extra packages with `pipenv run pip install -r visualization_requirements.txt`).
+
+---
+
+## Repository structure
+
+```
+lidar-ros2/
+├── src/
+│   ├── lidar_py_pkg/        # Python nodes: fusion, DBSCAN detector, tracker, metrics logger, utilities
+│   ├── lidar_cpp_pkg/       # C++ nodes: PCL detector, filter, monitor
+│   ├── lidar_description/   # URDF/Xacro with the sensor frames
+│   ├── lidar_bringup/       # launch files, YAML configs, RViz configs (rviz/)
+│   └── sick_scan_xd/        # SICK driver (git submodule, needed for live sensors)
+├── tuner/                   # web-based live parameter tuner
+├── results/                 # metric logs (CSV) and plots
+├── bags/                    # place for ros2 bag recordings (not tracked in git)
+├── Pipfile, Pipfile.lock    # Python dependencies (pipenv)
+└── .envrc                   # optional direnv setup
+```
 
 ---
 
 ## Requirements
-- **Ubuntu 24.04**
-- **ROS 2 Jazzy**
-- **Python 3.12**
-- **colcon**
-- **pipx**
-- **pipenv**
-- **PCL (system packages)**
-- **sick_scan_xd (for live Lidar data)**
 
+- Ubuntu 24.04, ROS 2 Jazzy, Python 3.12
+- colcon, rosdep, PCL (system packages)
+- pipenv (installed via pipx); direnv is optional
+- `sick_scan_xd` submodule for live sensor data
 
----
-
-## Install / Clone
+## Installation
 
 ```bash
-#update + basic tools
+# ROS 2 build tools
 sudo apt update
-sudo apt upgrade
-sudo apt install -y git curl build-essential python3 python3-pip python3-venv python3-dev
-
-#pipx (recommended way to install Python CLI tools globally)
-sudo apt install -y pipx
-pipx ensurepath
-#Close/reopen your terminal OR run:
-source ~/.bashrc
-
-#Install pipenv globally via pipx
+sudo apt install -y git build-essential python3-colcon-common-extensions python3-rosdep pipx
+pipx ensurepath && source ~/.bashrc
 pipx install pipenv
-pipenv --version
-
-#Optional but recommended: direnv
-sudo apt install -y direnv
-#Enable direnv for bash:
-grep -q 'direnv hook bash' ~/.bashrc || echo 'eval "$(direnv hook bash)"' >> ~/.bashrc
-source ~/.bashrc
-#Make pipenv create .venv inside the project (recommended)
-grep -q 'PIPENV_VENV_IN_PROJECT=1' ~/.bashrc || echo 'export PIPENV_VENV_IN_PROJECT=1' >> ~/.bashrc
-source ~/.bashrc
-
-#If ROS 2 Jazzy is installed, this should work:
-source /opt/ros/jazzy/setup.bash
-echo $ROS_DISTRO    #Expected: jazzy
-#install common build helpers (safe to do):
-sudo apt install -y python3-colcon-common-extensions python3-rosdep
-#Initialize rosdep (one-time):
 sudo rosdep init || true
 rosdep update
 
-#Clone repo WITH submodules
-mkdir -p ~/lidar_ws 
-cd ~/lidar_ws          
-
-git clone --recurse-submodules git@github.com:HWLs-any/lidar-ros2.git .
-cd lidar_ws
-
-#Only use this, if you forgot to clone with submodule
+# Clone with submodules
+git clone --recurse-submodules https://github.com/atlasvoxel/lidar-ros2.git ~/lidar_ws
+cd ~/lidar_ws
+# if you forgot --recurse-submodules:
 git submodule update --init --recursive
 
-#You have cloned repo sucessfully
-
-
-#If you use direnv: create/enable .envrc
-cd ~/lidar_ws          
-cat > .envrc <<'EOF'
-# ROS 2 Jazzy
-source /opt/ros/jazzy/setup.bash
-
-# Project-local pipenv venv
+# Python environment (venv inside the project)
 export PIPENV_VENV_IN_PROJECT=1
-
-# Optional overlay (after first build)
-if [ -f install/setup.bash ]; then
-  source install/setup.bash
-fi
-EOF
-
-direnv allow
-
-#Create the pipenv virtualenv (Python 3.12)
 pipenv --python 3.12
+pipenv install            # installs from Pipfile.lock
 
-#Install Python libraries needed by nodes
-
-#These are the ones I’ve been using in code:
-pipenv install numpy scikit-learn open3d
-
-#Important for ROS builds inside pipenv (I hit these missing error before):
-pipenv install empy catkin_pkg
-
-
-#Install ROS package dependencies (rosdep)
-cd ~/lidar_ws
+# ROS dependencies and build
 source /opt/ros/jazzy/setup.bash
 rosdep install --from-paths src --ignore-src -r -y
-
-
-#Build (always through pipenv)
-cd ~/lidar_ws          #always build from here
 pipenv run colcon build --symlink-install
 source install/setup.bash
-
-
-#Sanity checks:
-pipenv run ros2 pkg list | grep -E "lidar_|sick_scan_xd"
-pipenv run ros2 pkg executables lidar_py_pkg
-pipenv run ros2 pkg executables lidar_cpp_pkg
-
-#Run (example)
-#Example launch (adjust to your actual file names):
-pipenv run ros2 launch lidar_bringup live_sensors_rviz.launch.xml
-
-````
----
-## Repository Structure
 ```
 
-lidar_ws/
-├── Pipfile
-├── Pipfile.lock
-├── src/
-│   ├── lidar_py_pkg/          # Python ROS 2 nodes (fusion, DBSCAN detector, utilities)
-│   ├── lidar_cpp_pkg/         # C++ ROS 2 nodes (PCL detector + metrics)
-│   ├── lidar_description/     # URDF/Xacro (frames)
-│   ├── lidar_bringup/         # XML launch files
-│   └── sick_scan_xd/          # (optional) SICK driver submodule for live operation
-├── rviz/                      # Saved RViz configs
-├── results/                   # Store result metrics
-└── bags/                      # (optional) ros2 bag recordings (not required for build)
+Optional: with direnv installed, run `direnv allow` once in `~/lidar_ws`. The included `.envrc` then sources ROS 2, the pipenv environment and the workspace overlay automatically.
 
-````
----
+Sanity check:
 
-## What the Code Does (Current Status)
+```bash
+pipenv run ros2 pkg executables lidar_py_pkg
+pipenv run ros2 pkg executables lidar_cpp_pkg
+```
 
-### Input
-- Four independent `PointCloud2` topics:
-  - `/front/cloud`, `/right/cloud`, `/back/cloud`, `/left/cloud`
+## Usage
 
-### Core Pipeline
-1. **TF / Frames**
-   - `lidar_description` provides a URDF/Xacro with fixed sensor frames
-   - `robot_state_publisher` publishes TF for consistent transforms
+All launch files are in `src/lidar_bringup/launch/`. Each starts the sensor input, the frames, the processing nodes, metrics logging and RViz.
 
-2. **Fusion (Python) — `lidar_py_pkg/cloud_fusion`**
-   - Subscribes to all four point cloud topics
-   - Transforms each cloud into a shared `target_frame` (default: `base_link`)
-   - Applies voxel-based de-duplication
-   - Publishes the fused cloud:
-     - `/nova/cloud_fused`
+| Launch file | Purpose |
+|---|---|
+| `live_sensor.launch.xml` | Live sensors, fusion, PCL and DBSCAN detection side by side |
+| `pcl_fused.launch.xml` / `pcl_per_sensor.launch.xml` | PCL detector on the fused cloud / on each sensor, with metrics logging |
+| `dbscan_fused.launch.xml` / `dbscan_per_sensor.launch.xml` | DBSCAN detector on the fused cloud / on each sensor, with metrics logging |
+| `live_tracking.launch.xml` | Fusion, both detectors and Kalman tracking |
+| `bag_data.launch.xml` | Replay a recorded bag instead of live sensors (both detectors) |
 
-3. **Object Detection / Clustering (two algorithms)**
-   - **C++ / PCL — `lidar_cpp_pkg/object_detector_pcl`**
-     - Voxel downsampling
-     - Statistical outlier removal
-     - Plane segmentation (RANSAC) for ground removal
-     - Euclidean clustering
-     - Publishes `MarkerArray` bounding boxes for RViz
-     - Supports **metrics output** (latency, detections count, etc.)
-   - **Python / DBSCAN — `lidar_py_pkg/cloud_detector`**
-     - Optional voxel downsample
-     - DBSCAN clustering
-     - Publishes `MarkerArray` bounding boxes for RViz
+```bash
+pipenv run ros2 launch lidar_bringup pcl_fused.launch.xml
+pipenv run ros2 launch lidar_bringup live_tracking.launch.xml
+pipenv run ros2 launch lidar_bringup bag_data.launch.xml bag_path:=/path/to/your/bag
+```
 
-### Visualization
-- RViz shows:
-  - Per-sensor point clouds
-  - Fused cloud
-  - Bounding-box markers from C++ and Python detectors
-  - TF frames
+Live parameter tuning (while the pipeline is running):
 
----
+```bash
+pipenv run python3 tuner/param_tuner.py   # then open http://localhost:5000
+```
+
+Parameters live in `src/lidar_bringup/config/` (`fusion.yaml`, `detector_cpp.yaml`, `dbscan_fused.yaml`, `tracker.yaml`). To track DBSCAN detections instead of PCL, set `input_topic: /detections/dbscan/fused` in `tracker.yaml`.
